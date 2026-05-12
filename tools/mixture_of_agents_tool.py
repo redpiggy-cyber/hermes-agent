@@ -60,8 +60,8 @@ logger = logging.getLogger(__name__)
 # Requesty router support
 _REQUESTY_BASE_URL = "https://router.requesty.ai/v1"
 
-# OpenRouter base URL (fallback)
-_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_requesty_client = None
+
 
 def _get_requesty_key() -> str | None:
     """Lazy-read Requesty API key from environment or .env file."""
@@ -78,6 +78,28 @@ def _get_requesty_key() -> str | None:
                     if line.startswith("REQUESTY_API_KEY="):
                         return line.split("=", 1)[1].strip().strip('"').strip("'")
     return None
+
+
+def _get_async_client():
+    """Return the MoA async client, preferring Requesty and falling back to OpenRouter.
+
+    Requesty is OpenAI-compatible and is preferred when REQUESTY_API_KEY is
+    configured. If it is unavailable, reuse Hermes' shared OpenRouter client.
+    """
+    requesty_key = _get_requesty_key()
+    if requesty_key:
+        global _requesty_client
+        if _requesty_client is None:
+            from openai import AsyncOpenAI
+
+            _requesty_client = AsyncOpenAI(
+                api_key=requesty_key,
+                base_url=_REQUESTY_BASE_URL,
+            )
+        return _requesty_client
+
+    return _get_openrouter_client()
+
 
 # Configuration for MoA processing
 # Reference models - these generate diverse initial responses in parallel.
@@ -166,7 +188,7 @@ async def _run_reference_model_safe(
             if not model.lower().startswith('gpt-'):
                 api_params["temperature"] = temperature
             
-            response = await _get_openrouter_client().chat.completions.create(**api_params)
+            response = await _get_async_client().chat.completions.create(**api_params)
             
             content = extract_content_or_reasoning(response)
             if not content:
@@ -241,14 +263,14 @@ async def _run_aggregator_model(
     if not AGGREGATOR_MODEL.lower().startswith('gpt-'):
         api_params["temperature"] = temperature
 
-    response = await _get_openrouter_client().chat.completions.create(**api_params)
+    response = await _get_async_client().chat.completions.create(**api_params)
 
     content = extract_content_or_reasoning(response)
 
     # Retry once on empty content (reasoning-only response)
     if not content:
         logger.warning("Aggregator returned empty content, retrying once")
-        response = await _get_openrouter_client().chat.completions.create(**api_params)
+        response = await _get_async_client().chat.completions.create(**api_params)
         content = extract_content_or_reasoning(response)
 
     logger.info("Aggregation complete (%s characters)", len(content))
@@ -322,15 +344,7 @@ async def mixture_of_agents_tool(
         logger.info("Query: %s", user_prompt[:100])
         
         # Validate API key availability — prefer Requesty, fallback to OpenRouter
-        openrouter_key = os.getenv("OPENROUTER_API_KEY")
-        requesty_key = _get_requesty_key()
-        if requesty_key:
-            base_url = _REQUESTY_BASE_URL
-            api_key = requesty_key
-        elif openrouter_key:
-            base_url = _OPENROUTER_BASE_URL
-            api_key = openrouter_key
-        else:
+        if not (_get_requesty_key() or check_openrouter_api_key()):
             return "Error: No API key found. Set REQUESTY_API_KEY or OPENROUTER_API_KEY."
         
         # Use provided models or defaults
@@ -446,7 +460,7 @@ def check_moa_requirements() -> bool:
     Returns:
         bool: True if requirements are met, False otherwise
     """
-    return check_openrouter_api_key()
+    return bool(_get_requesty_key() or check_openrouter_api_key())
 
 
 
@@ -475,16 +489,16 @@ if __name__ == "__main__":
     print("🤖 Mixture-of-Agents Tool Module")
     print("=" * 50)
     
-    # Check if API key is available
-    api_available = check_openrouter_api_key()
+    # Check if Requesty or OpenRouter API key is available
+    api_available = check_moa_requirements()
     
     if not api_available:
-        print("❌ OPENROUTER_API_KEY environment variable not set")
-        print("Please set your API key: export OPENROUTER_API_KEY='your-key-here'")
-        print("Get API key at: https://openrouter.ai/")
+        print("❌ REQUESTY_API_KEY or OPENROUTER_API_KEY environment variable not set")
+        print("Please set your API key: export REQUESTY_API_KEY='your-key-here' or OPENROUTER_API_KEY='your-key-here'")
+        print("Get OpenRouter API key at: https://openrouter.ai/")
         exit(1)
     else:
-        print("✅ OpenRouter API key found")
+        print("✅ Requesty/OpenRouter API key found")
     
     print("🛠️  MoA tools ready for use!")
     
