@@ -249,7 +249,7 @@ async function startSocket() {
 
       // Handle fromMe messages based on mode
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) continue;
+        if (chatId.includes('status')) continue;
 
         if (WHATSAPP_MODE === 'bot') {
           // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
@@ -264,7 +264,7 @@ async function startSocket() {
         const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
         const chatNumber = chatId.replace(/@.*/, '');
         const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-        if (!isSelfChat) continue;
+        if (!isSelfChat && !isGroup) continue;
       }
 
       // Handle !fromMe messages (from other people) based on mode.
