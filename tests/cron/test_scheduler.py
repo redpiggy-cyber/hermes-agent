@@ -2597,3 +2597,113 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == str(fast.resolve())
+
+
+# ── Truncation guard tests ──────────────────────────────────────
+
+class TestLooksLikeTruncatedCronResponse:
+    """Unit tests for `_looks_like_truncated_cron_response()`."""
+
+    def test_empty_or_whitespace(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        assert not _looks_like_truncated_cron_response("")
+        assert not _looks_like_truncated_cron_response("   ")
+        assert not _looks_like_truncated_cron_response("\n\n")
+
+    def test_explicit_truncation_markers(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        # Explicit markers at the end should signal truncation.
+        assert _looks_like_truncated_cron_response("Here is the report...")
+        assert _looks_like_truncated_cron_response("Result: [...]")
+        assert _looks_like_truncated_cron_response("The answer is 42[truncated]")
+        assert _looks_like_truncated_cron_response("Summary(truncated)")
+        assert _looks_like_truncated_cron_response("Final[TRUNCATED]")
+
+    def test_marker_embedded_not_at_end(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        # Marker in the middle of text, with proper closure after, is fine.
+        assert not _looks_like_truncated_cron_response(
+            "Here... is a complete sentence."
+        )
+        assert not _looks_like_truncated_cron_response(
+            "I said [...] but then finished properly."
+        )
+
+    def test_unbalanced_triple_backticks(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        assert _looks_like_truncated_cron_response("```python\nprint('hello')\n")
+        assert not _looks_like_truncated_cron_response(
+            "```python\nprint('hello')\n```\nComplete."
+        )
+
+    def test_unbalanced_single_backticks(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        assert _looks_like_truncated_cron_response(
+            "The variable `count was never"
+        )
+        assert not _looks_like_truncated_cron_response(
+            "The variable `count` is correct."
+        )
+
+    def test_complete_response_is_not_truncated(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        # Well-formed sentence ending with punctuation.
+        assert not _looks_like_truncated_cron_response(
+            "The market closed at 45,200. Volume was above average."
+        )
+        # Ends with a list item — structural, not prose mid-sentence.
+        assert not _looks_like_truncated_cron_response(
+            "Daily summary:\n- AAPL up 1.2%\n- TSLA down 0.8%\n"
+        )
+
+    def test_prose_mid_sentence_flagged(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        # Long response that just stops mid-word — clearly truncated.
+        long_prose = (
+            "The quarterly earnings report for Q2 showed significant "
+            "growth across all business segments. Revenue increased by "
+            "23% year-over-year, driven primarily by the cloud division "
+            "which saw a 45% increase in enterprise adoption. The company "
+            "also announced plans to expand into the European market with "
+            "a new data center in Frankfurt. However, margins were slightly "
+            "compressed due to higher infrastructure costs and the ongoing "
+            "semiconductor shortage which has impacted the"
+        )
+        assert _looks_like_truncated_cron_response(long_prose)
+
+    def test_short_response_not_flagged(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        # Short responses (≤120 chars) shouldn't be falsely flagged
+        # even if they don't end with sentence-ending punctuation.
+        short = "The answer is 42"
+        assert not _looks_like_truncated_cron_response(short)
+
+    def test_ends_with_code_block_is_ok(self):
+        from cron.scheduler import _looks_like_truncated_cron_response
+        # Code blocks are structural — not prose mid-sentence.
+        response = "Here is the fix:\n\n```python\ndef foo():\n    return 42\n```"
+        assert not _looks_like_truncated_cron_response(response)
+
+
+class TestGetModelLabel:
+    """Unit tests for `_get_model_label()`."""
+
+    def test_full_model_and_provider(self):
+        from cron.scheduler import _get_model_label
+        label = _get_model_label({}, default_model="deepseek-v4-pro", provider="deepseek")
+        assert label == "deepseek-v4-pro (deepseek)"
+
+    def test_model_only_no_provider(self):
+        from cron.scheduler import _get_model_label
+        label = _get_model_label({}, default_model="gpt-4o", provider="")
+        assert label == "gpt-4o"
+
+    def test_provider_only_no_model(self):
+        from cron.scheduler import _get_model_label
+        label = _get_model_label({}, default_model="", provider="openai")
+        assert label == "openai"
+
+    def test_nothing_available(self):
+        from cron.scheduler import _get_model_label
+        label = _get_model_label({}, default_model="", provider="")
+        assert label == "unknown"

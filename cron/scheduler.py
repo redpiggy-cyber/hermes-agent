@@ -147,6 +147,77 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
+# ── Truncation guard ──────────────────────────────────────────────
+
+_TRUNCATION_SIGNALS = frozenset({
+    "...", "[...]", "[truncated]", "(truncated)", "[TRUNCATED]",
+})
+
+def _looks_like_truncated_cron_response(response: str) -> bool:
+    """Heuristic: check whether a cron agent response looks truncated.
+
+    Cron agents run with a finite token budget. When the model hits the
+    limit mid-reply the response is often missing closing punctuation,
+    has unbalanced markdown fences, or ends with an explicit truncation
+    marker.  Delivering this silently makes the cron output misleading.
+
+    Returns True when at least one truncation signal fires.  The caller
+    should surface a warning alongside the response so the operator
+    knows the output may be incomplete.
+    """
+    if not response or not response.strip():
+        return False
+
+    stripped = response.strip()
+
+    # 1. Explicit truncation marker at the very end.
+    for marker in _TRUNCATION_SIGNALS:
+        if stripped.endswith(marker):
+            return True
+
+    # 2. Unbalanced markdown fences — more opening than closing.
+    triple_backticks = stripped.count("```")
+    if triple_backticks % 2 != 0:
+        return True
+
+    single_backticks = stripped.count("`")
+    # Single backticks always need an even count (inline code).
+    if single_backticks % 2 != 0:
+        return True
+
+    # 3. Ends mid-sentence — no sentence-ending punctuation.
+    sentence_enders = (".", "!", "?", "。", "！", "？", "”", '"', ")", "]", "}")
+    last_char = stripped[-1]
+    if last_char not in sentence_enders and not last_char.isspace():
+        # Peek at last 60 chars: if the final "sentence chunk" has no
+        # structural closure (punctuation, fence, list marker), flag it.
+        tail = stripped[-60:]
+        # A response that naturally ends mid-structure is normally fine
+        # (e.g. code blocks, lists). Only flag prose-like tails.
+        has_structural_end = any(
+            c in tail for c in (".", "!", "?", "。", "！", "？", "```", "\n- ", "\n* ")
+        )
+        if not has_structural_end and len(stripped) > 120:
+            return True
+
+    return False
+
+
+def _get_model_label(job: dict, default_model: str = "", provider: str = "") -> str:
+    """Build a compact model+provider label for cron output headers.
+
+    Returns something like ``"deepseek-v4-pro (deepseek)"`` or
+    ``"gpt-4o (openai)"``.  Falls back through job-level, env, and
+    config defaults; uses whatever is available.
+    """
+    model = default_model or ""
+    prov = (provider or "").strip().lower()
+    if prov:
+        label = f"{model} ({prov})" if model else prov
+    else:
+        label = model or "unknown"
+    return label
+
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -1655,6 +1726,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_db=_session_db,
         )
         
+        # Model label for output headers — computed once so both success
+        # and failure paths can include it.
+        _model_label = _get_model_label(
+            job, default_model=model, provider=runtime.get("provider", "")
+        )
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -1771,12 +1847,23 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+        # Check for truncated response — cron agents have finite token
+        # budgets and may produce incomplete output that looks successful.
+        _truncation_note = ""
+        if final_response and _looks_like_truncated_cron_response(final_response):
+            _truncation_note = (
+                "\n\n⚠️ **The response above may be truncated** — the model "
+                "likely hit its token limit mid-reply. Consider reducing the "
+                "prompt, increasing the model's context window, or splitting "
+                "the job into smaller chunks.\n"
+            )
         
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
+**Model:** {_model_label}
 
 ## Prompt
 
@@ -1784,7 +1871,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 ## Response
 
-{logged_response}
+{logged_response}{_truncation_note}
 """
         
         logger.info("Job '%s' completed successfully", job_name)
@@ -1799,6 +1886,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
+**Model:** {_model_label}
 
 ## Prompt
 
